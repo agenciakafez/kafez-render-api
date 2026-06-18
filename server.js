@@ -6,7 +6,7 @@ const https = require("https");
 const http = require("http");
 
 const app = express();
-app.use(express.json({ limit: "100mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 8080;
 const OUTPUT_DIR = path.join(__dirname, "outputs");
@@ -17,7 +17,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "online",
     service: "Kafez Render API",
-    version: "timeline-v1"
+    version: "timeline-v2"
   });
 });
 
@@ -26,24 +26,29 @@ function downloadFile(url, filepath) {
     const client = url.startsWith("https") ? https : http;
     const file = fs.createWriteStream(filepath);
 
-    client.get(url, (response) => {
-      if (response.statusCode >= 400) {
-        return reject(new Error(`Erro ao baixar arquivo: ${response.statusCode}`));
-      }
+    client
+      .get(url, (response) => {
+        if (response.statusCode >= 400) {
+          return reject(new Error(`Erro ao baixar arquivo: ${response.statusCode}`));
+        }
 
-      response.pipe(file);
+        response.pipe(file);
 
-      file.on("finish", () => {
-        file.close(resolve);
-      });
-    }).on("error", reject);
+        file.on("finish", () => {
+          file.close(resolve);
+        });
+      })
+      .on("error", reject);
   });
 }
 
 function runCommand(command) {
   return new Promise((resolve, reject) => {
-    exec(command, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
-      if (error) return reject(new Error(stderr || error.message));
+    exec(command, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
+      if (error) {
+        return reject(new Error(stderr || error.message));
+      }
+
       resolve({ stdout, stderr });
     });
   });
@@ -60,7 +65,23 @@ function escapeText(text) {
 
 function hexToDrawtextColor(color) {
   if (!color) return "white";
-  return color.replace("#", "0x");
+  return String(color).replace("#", "0x");
+}
+
+function resolveX(x) {
+  if (x === "center") return "(w-text_w)/2";
+  if (x === "left") return "80";
+  if (x === "right") return "w-text_w-80";
+  if (typeof x === "number") return String(x);
+  return "(w-text_w)/2";
+}
+
+function resolveY(y) {
+  if (y === "center") return "(h-text_h)/2";
+  if (y === "top") return "160";
+  if (y === "bottom") return "h-350";
+  if (typeof y === "number") return String(y);
+  return "h-350";
 }
 
 app.post("/render", async (req, res) => {
@@ -103,20 +124,10 @@ app.post("/render", async (req, res) => {
 
       const durationPart = end !== null && end > start ? `-t ${end - start}` : "";
 
-      const command = `
-        ffmpeg -y -ss ${start} -i "${inputPath}" ${durationPart}
-        -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
-        -r 30
-        -c:v libx264
-        -preset veryfast
-        -crf 23
-        -c:a aac
-        -ar 44100
-        -ac 2
-        "${cutPath}"
-      `;
+      const command = `ffmpeg -y -ss ${start} -i "${inputPath}" ${durationPart} -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1" -r 30 -c:v libx264 -preset veryfast -crf 23 -c:a aac -ar 44100 -ac 2 "${cutPath}"`;
 
       await runCommand(command);
+
       processedVideos.push(cutPath);
     }
 
@@ -132,53 +143,39 @@ app.post("/render", async (req, res) => {
 
     let currentVideoPath = concatPath;
 
-    if (texts && Array.isArray(texts) && texts.length > 0) {
+    if (Array.isArray(texts) && texts.length > 0) {
       const textOutputPath = path.join(jobDir, "with_text.mp4");
 
-      const drawtextFilters = texts.map((t) => {
-        const text = escapeText(t.text);
-        const fontSize = t.fontSize || 64;
-        const color = hexToDrawtextColor(t.color || "#FFFFFF");
-        const start = t.start || 0;
-        const end = t.end || 9999;
+      const drawtextFilters = texts
+        .map((t) => {
+          const text = escapeText(t.text);
+          const fontSize = t.fontSize || 64;
+          const color = hexToDrawtextColor(t.color || "#FFFFFF");
+          const start = t.start || 0;
+          const end = t.end || 9999;
+          const x = resolveX(t.x);
+          const y = resolveY(t.y);
 
-        let x = t.x || "(w-text_w)/2";
-        let y = t.y || "h-350";
+          const box = t.backgroundColor
+            ? ":box=1:boxcolor=black@0.45:boxborderw=30"
+            : "";
 
-        if (x === "center") x = "(w-text_w)/2";
-        if (x === "left") x = "80";
-        if (x === "right") x = "w-text_w-80";
+          return `drawtext=text='${text}':fontcolor=${color}:fontsize=${fontSize}:x=${x}:y=${y}:enable='between(t,${start},${end})'${box}`;
+        })
+        .join(",");
 
-        if (y === "center") y = "(h-text_h)/2";
-        if (y === "bottom") y = "h-350";
-        if (y === "top") y = "160";
+      const textCommand = `ffmpeg -y -i "${currentVideoPath}" -vf "${drawtextFilters}" -c:v libx264 -preset veryfast -crf 23 -c:a copy "${textOutputPath}"`;
 
-        const box = t.backgroundColor ? ":box=1:boxcolor=black@0.45:boxborderw=30" : "";
-
-        return `drawtext=text='${text}':fontcolor=${color}:fontsize=${fontSize}:x=${x}:y=${y}:enable='between(t,${start},${end})'${box}`;
-      }).join(",");
-
-      await runCommand(`
-        ffmpeg -y -i "${currentVideoPath}"
-        -vf "${drawtextFilters}"
-        -c:v libx264
-        -preset veryfast
-        -crf 23
-        -c:a copy
-        "${textOutputPath}"
-      `);
+      await runCommand(textCommand);
 
       currentVideoPath = textOutputPath;
     }
 
-    let audioInputs = [];
-    let filterAudio = "";
-    let mapAudio = "";
+    const finalPath = path.join(jobDir, "output.mp4");
 
     if (audio?.url || music?.url) {
-      const finalPath = path.join(jobDir, "output.mp4");
-
       let command = `ffmpeg -y -i "${currentVideoPath}"`;
+      const audioInputs = [];
 
       if (audio?.url) {
         const audioPath = path.join(jobDir, "audio.mp3");
@@ -200,6 +197,8 @@ app.post("/render", async (req, res) => {
         });
       }
 
+      let filterAudio = "";
+
       if (audioInputs.length === 1) {
         filterAudio = `-filter_complex "[${audioInputs[0].index}:a]volume=${audioInputs[0].volume}[aout]"`;
       }
@@ -208,23 +207,11 @@ app.post("/render", async (req, res) => {
         filterAudio = `-filter_complex "[${audioInputs[0].index}:a]volume=${audioInputs[0].volume}[a1];[${audioInputs[1].index}:a]volume=${audioInputs[1].volume}[a2];[a1][a2]amix=inputs=2:duration=longest[aout]"`;
       }
 
-      mapAudio = `-map 0:v -map "[aout]"`;
-
-      command += `
-        ${filterAudio}
-        ${mapAudio}
-        -c:v copy
-        -c:a aac
-        -shortest
-        "${finalPath}"
-      `;
+      command += ` ${filterAudio} -map 0:v -map "[aout]" -c:v copy -c:a aac -shortest "${finalPath}"`;
 
       await runCommand(command);
-      currentVideoPath = finalPath;
     } else {
-      const finalPath = path.join(jobDir, "output.mp4");
       fs.copyFileSync(currentVideoPath, finalPath);
-      currentVideoPath = finalPath;
     }
 
     res.json({
@@ -234,7 +221,6 @@ app.post("/render", async (req, res) => {
       output: `/outputs/${jobId}/output.mp4`,
       url: `${req.protocol}://${req.get("host")}/outputs/${jobId}/output.mp4`
     });
-
   } catch (error) {
     res.status(500).json({
       error: "Erro ao renderizar vídeo",
